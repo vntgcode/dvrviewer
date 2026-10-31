@@ -23,6 +23,7 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # jpg/15/42.53[M]... means 15:42:53.
 IMAGE_RE = re.compile(r"^(\d{2})\.(\d{2})")
 COMPACT_IMAGE_RE = re.compile(r"^(\d{2})(\d{2})(?:\[|$)")
+SECOND_IMAGE_RE = re.compile(r"^(\d{2})(?:\[|$)")
 VIDEO_RE = re.compile(r"^(\d{2})\.(\d{2})\.(\d{2})-(\d{2})\.(\d{2})\.(\d{2})")
 
 
@@ -45,6 +46,20 @@ def _image_timestamp(day: str, hour: str, filename: str) -> datetime | None:
     try:
         minute, second = map(int, match.groups())
         return datetime.combine(datetime.strptime(day, "%Y-%m-%d").date(), time(int(hour), minute, second))
+    except ValueError:
+        return None
+
+
+def _nested_image_timestamp(day: str, path: Path) -> datetime | None:
+    """Parse jpg/<hour>/<minute>/<second>[event].jpg recordings."""
+    match = SECOND_IMAGE_RE.match(path.name)
+    if not match:
+        return None
+    try:
+        return datetime.combine(
+            datetime.strptime(day, "%Y-%m-%d").date(),
+            time(int(path.parent.parent.name), int(path.parent.name), int(match.group(1))),
+        )
     except ValueError:
         return None
 
@@ -98,19 +113,18 @@ class MediaIndex:
               video_end=excluded.video_end, size=excluded.size, mtime_ns=excluded.mtime_ns, last_seen=excluded.last_seen
         """, (relative, camera, day, kind, path.name, image_time, video_start, video_end, stat.st_size, stat.st_mtime_ns, scan_id))
 
-    def _scan_media(self, connection: sqlite3.Connection, scan_id: int, camera: str, day: str, base: Path, image_pattern: str, video_pattern: str, image_hour: Any) -> None:
+    def _scan_media(self, connection: sqlite3.Connection, scan_id: int, camera: str, day: str, base: Path, image_pattern: str, video_pattern: str, image_stamp: Any) -> None:
         for image in base.glob(image_pattern):
             # Doorbell events include a smaller [1] companion image beside the
             # full-resolution [0] image for the same timestamp.
             if image.name.endswith("[1].jpg"):
                 continue
-            self._index_file(connection, scan_id, image, camera, day, "image", lambda: self._parse_image(day, image_hour(image), image.name))
+            self._index_file(connection, scan_id, image, camera, day, "image", lambda: self._image_record(image_stamp(image)))
         for video in base.glob(video_pattern):
             self._index_file(connection, scan_id, video, camera, day, "video", lambda: self._parse_video(day, video.name))
 
     @staticmethod
-    def _parse_image(day: str, hour: str, filename: str) -> tuple[str, None, None] | None:
-        stamp = _image_timestamp(day, hour, filename)
+    def _image_record(stamp: datetime | None) -> tuple[str, None, None] | None:
         return (stamp.isoformat(), None, None) if stamp else None
 
     @staticmethod
@@ -155,7 +169,22 @@ class MediaIndex:
                             if not channel_dir.is_dir():
                                 continue
                             camera_name = camera_root.name if channel_dir.name == "001" else f"{camera_root.name} / {channel_dir.name}"
-                            self._scan_media(connection, scan_id, camera_name, day_dir.name, channel_dir, "jpg/*/*.jpg", "dav/*/*.mp4", lambda image: image.parent.name)
+                            self._scan_media(connection, scan_id, camera_name, day_dir.name, channel_dir, "jpg/*/*.jpg", "dav/*/*.mp4", lambda image: _image_timestamp(day_dir.name, image.parent.name, image.name))
+                            self._scan_media(connection, scan_id, camera_name, day_dir.name, channel_dir, "jpg/*/*/*.jpg", "dav/*/*.mp4", lambda image: _nested_image_timestamp(day_dir.name, image))
+                    # Some exports add a source-camera directory below the user-facing
+                    # camera folder: <camera>/<source-camera>/YYYY-MM-DD/001/...
+                    for source_camera_dir in camera_root.iterdir():
+                        if not source_camera_dir.is_dir():
+                            continue
+                        for day_dir in source_camera_dir.iterdir():
+                            if not day_dir.is_dir() or not DATE_RE.match(day_dir.name):
+                                continue
+                            for channel_dir in day_dir.iterdir():
+                                if not channel_dir.is_dir():
+                                    continue
+                                camera_name = camera_root.name if channel_dir.name == "001" else f"{camera_root.name} / {channel_dir.name}"
+                                self._scan_media(connection, scan_id, camera_name, day_dir.name, channel_dir, "jpg/*/*.jpg", "dav/*/*.mp4", lambda image: _image_timestamp(day_dir.name, image.parent.name, image.name))
+                                self._scan_media(connection, scan_id, camera_name, day_dir.name, channel_dir, "jpg/*/*/*.jpg", "dav/*/*.mp4", lambda image: _nested_image_timestamp(day_dir.name, image))
                     # Doorbell layout: <camera>/YYYY/MM/DD/HH/{jpg,dav}/file.
                     for year_dir in camera_root.iterdir():
                         if not year_dir.is_dir() or not re.match(r"^\d{4}$", year_dir.name):
@@ -167,7 +196,7 @@ class MediaIndex:
                                 if not day_dir.is_dir() or not re.match(r"^\d{2}$", day_dir.name):
                                     continue
                                 day = f"{year_dir.name}-{month_dir.name}-{day_dir.name}"
-                                self._scan_media(connection, scan_id, camera_root.name, day, day_dir, "*/jpg/*.jpg", "*/dav/*.mp4", lambda image: image.parent.parent.name)
+                                self._scan_media(connection, scan_id, camera_root.name, day, day_dir, "*/jpg/*.jpg", "*/dav/*.mp4", lambda image: _image_timestamp(day, image.parent.parent.name, image.name))
             connection.execute("DELETE FROM media WHERE last_seen != ?", (scan_id,))
             connection.commit()
             self._days = self._load_index(connection)
