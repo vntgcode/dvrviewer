@@ -17,10 +17,6 @@ The gallery shows recent still images for a date and camera. Selecting one opens
 
 By default, Compose mounts the local `./recordings` directory. To use a NAS mount elsewhere, set `RECORDINGS_PATH` to the directory that directly contains the camera-name folders. For example:
 
-```dotenv
-RECORDINGS_PATH=/mnt/nas/amcrest
-```
-
 Pull and start (or recreate) the service:
 
 ```sh
@@ -39,3 +35,5 @@ The application never changes mounted recordings. The Compose mount is explicitl
 ## Notes
 
 MP4 playback depends on the video/audio codecs produced by the camera. H.264/AAC MP4 is broadly compatible with iOS Safari and Firefox. If a camera writes a different codec, the browser may display the file but not decode it; transcoding would need to be added separately.
+
+This project was created using an LLM and is designed to be just enough to meet the basic goals. 
