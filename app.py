@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 from datetime import datetime, time
 from pathlib import Path
 from threading import Lock
@@ -15,6 +16,7 @@ from flask import Flask, abort, jsonify, render_template, send_file
 MEDIA_ROOT = Path(os.environ.get("MEDIA_ROOT", "/recordings")).resolve()
 SCAN_INTERVAL = max(1, int(os.environ.get("SCAN_INTERVAL", "15")))
 IMAGE_LIMIT = max(1, int(os.environ.get("IMAGE_LIMIT", "500")))
+INDEX_DATABASE = Path(os.environ.get("INDEX_DATABASE", "/data/dvrviewer.sqlite3"))
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # Amcrest JPG names omit the hour because it is encoded by the parent directory:
@@ -56,24 +58,79 @@ class MediaIndex:
         self._lock = Lock()
         self._days: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {}
 
+    def _connect(self) -> sqlite3.Connection:
+        INDEX_DATABASE.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(INDEX_DATABASE, timeout=30)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS media (
+                path TEXT PRIMARY KEY, camera TEXT NOT NULL, day TEXT NOT NULL,
+                kind TEXT NOT NULL, name TEXT NOT NULL, image_time TEXT,
+                video_start TEXT, video_end TEXT, size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL, last_seen INTEGER NOT NULL
+            )
+        """)
+        connection.execute("CREATE INDEX IF NOT EXISTS media_camera_day ON media(camera, day)")
+        return connection
+
     def _relative(self, path: Path) -> str:
         return path.relative_to(self.root).as_posix()
 
-    def _scan_media(self, day: str, base: Path, image_pattern: str, video_pattern: str, image_hour: Any) -> dict[str, list[dict[str, Any]]]:
-        images, videos = [], []
+    def _index_file(self, connection: sqlite3.Connection, scan_id: int, path: Path, camera: str, day: str, kind: str, parser: Any) -> None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        relative = self._relative(path)
+        existing = connection.execute("SELECT size, mtime_ns FROM media WHERE path = ?", (relative,)).fetchone()
+        if existing == (stat.st_size, stat.st_mtime_ns):
+            connection.execute("UPDATE media SET last_seen = ? WHERE path = ?", (scan_id, relative))
+            return
+        parsed = parser()
+        if parsed is None:
+            return
+        image_time, video_start, video_end = parsed
+        connection.execute("""
+            INSERT INTO media (path, camera, day, kind, name, image_time, video_start, video_end, size, mtime_ns, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET camera=excluded.camera, day=excluded.day, kind=excluded.kind,
+              name=excluded.name, image_time=excluded.image_time, video_start=excluded.video_start,
+              video_end=excluded.video_end, size=excluded.size, mtime_ns=excluded.mtime_ns, last_seen=excluded.last_seen
+        """, (relative, camera, day, kind, path.name, image_time, video_start, video_end, stat.st_size, stat.st_mtime_ns, scan_id))
+
+    def _scan_media(self, connection: sqlite3.Connection, scan_id: int, camera: str, day: str, base: Path, image_pattern: str, video_pattern: str, image_hour: Any) -> None:
         for image in base.glob(image_pattern):
             # Doorbell events include a smaller [1] companion image beside the
             # full-resolution [0] image for the same timestamp.
             if image.name.endswith("[1].jpg"):
                 continue
-            stamp = _image_timestamp(day, image_hour(image), image.name)
-            if stamp:
-                images.append({"path": self._relative(image), "time": stamp.isoformat(), "name": image.name})
+            self._index_file(connection, scan_id, image, camera, day, "image", lambda: self._parse_image(day, image_hour(image), image.name))
         for video in base.glob(video_pattern):
-            start, end = _timestamp(day, video.name, VIDEO_RE), _timestamp(day, video.name, VIDEO_RE, True)
-            if start and end and end >= start:
-                videos.append({"path": self._relative(video), "start": start.isoformat(), "end": end.isoformat(), "name": video.name})
-        return {"images": sorted(images, key=lambda x: x["time"]), "videos": sorted(videos, key=lambda x: x["start"])}
+            self._index_file(connection, scan_id, video, camera, day, "video", lambda: self._parse_video(day, video.name))
+
+    @staticmethod
+    def _parse_image(day: str, hour: str, filename: str) -> tuple[str, None, None] | None:
+        stamp = _image_timestamp(day, hour, filename)
+        return (stamp.isoformat(), None, None) if stamp else None
+
+    @staticmethod
+    def _parse_video(day: str, filename: str) -> tuple[None, str, str] | None:
+        start, end = _timestamp(day, filename, VIDEO_RE), _timestamp(day, filename, VIDEO_RE, True)
+        return (None, start.isoformat(), end.isoformat()) if start and end and end >= start else None
+
+    def _load_index(self, connection: sqlite3.Connection) -> dict[str, dict[str, dict[str, list[dict[str, Any]]]]]:
+        days: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {}
+        for camera, day, kind, path, name, image_time, video_start, video_end in connection.execute("SELECT camera, day, kind, path, name, image_time, video_start, video_end FROM media"):
+            gallery = days.setdefault(day, {}).setdefault(camera, {"images": [], "videos": []})
+            if kind == "image":
+                gallery["images"].append({"path": path, "time": image_time, "name": name})
+            else:
+                gallery["videos"].append({"path": path, "start": video_start, "end": video_end, "name": name})
+        for cameras in days.values():
+            for gallery in cameras.values():
+                gallery["images"].sort(key=lambda image: image["time"])
+                gallery["videos"].sort(key=lambda video: video["start"])
+        return days
 
     def refresh_if_needed(self, force: bool = False) -> None:
         import time as clock
@@ -83,7 +140,8 @@ class MediaIndex:
         with self._lock:
             if not force and clock.monotonic() - self._last_scan < SCAN_INTERVAL:
                 return
-            days: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {}
+            scan_id = clock.time_ns()
+            connection = self._connect()
             if self.root.is_dir():
                 # Recordings are grouped by the human-friendly camera name, then date,
                 # followed by the recorder's numeric channel directory.
@@ -93,16 +151,11 @@ class MediaIndex:
                     for day_dir in camera_root.iterdir():
                         if not day_dir.is_dir() or not DATE_RE.match(day_dir.name):
                             continue
-                        cameras = days.setdefault(day_dir.name, {})
                         for channel_dir in day_dir.iterdir():
                             if not channel_dir.is_dir():
                                 continue
                             camera_name = camera_root.name if channel_dir.name == "001" else f"{camera_root.name} / {channel_dir.name}"
-                            media = self._scan_media(day_dir.name, channel_dir, "jpg/*/*.jpg", "dav/*/*.mp4", lambda image: image.parent.name)
-                            if media["images"] or media["videos"]:
-                                cameras[camera_name] = media
-                        if not cameras:
-                            days.pop(day_dir.name, None)
+                            self._scan_media(connection, scan_id, camera_name, day_dir.name, channel_dir, "jpg/*/*.jpg", "dav/*/*.mp4", lambda image: image.parent.name)
                     # Doorbell layout: <camera>/YYYY/MM/DD/HH/{jpg,dav}/file.
                     for year_dir in camera_root.iterdir():
                         if not year_dir.is_dir() or not re.match(r"^\d{4}$", year_dir.name):
@@ -114,10 +167,11 @@ class MediaIndex:
                                 if not day_dir.is_dir() or not re.match(r"^\d{2}$", day_dir.name):
                                     continue
                                 day = f"{year_dir.name}-{month_dir.name}-{day_dir.name}"
-                                media = self._scan_media(day, day_dir, "*/jpg/*.jpg", "*/dav/*.mp4", lambda image: image.parent.parent.name)
-                                if media["images"] or media["videos"]:
-                                    days.setdefault(day, {})[camera_root.name] = media
-            self._days = days
+                                self._scan_media(connection, scan_id, camera_root.name, day, day_dir, "*/jpg/*.jpg", "*/dav/*.mp4", lambda image: image.parent.parent.name)
+            connection.execute("DELETE FROM media WHERE last_seen != ?", (scan_id,))
+            connection.commit()
+            self._days = self._load_index(connection)
+            connection.close()
             self._last_scan = clock.monotonic()
 
     def days(self) -> list[str]:

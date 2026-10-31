@@ -6,6 +6,8 @@ services:
     volumes:
       # Defaults to ./recordings; override RECORDINGS_PATH for a NAS mount elsewhere.
       - ${RECORDINGS_PATH:-./recordings}:/recordings:ro,Z
+      # Durable local metadata index; do not place this directory on the NAS share.
+      - ./data:/data:Z
     environment:
       # Seconds between filesystem scans; images added or removed appear after this interval.
       SCAN_INTERVAL: "15"

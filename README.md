@@ -32,6 +32,8 @@ Open `http://<docker-host>:8000` from Safari or Firefox. There is intentionally 
 
 The application never changes mounted recordings. The Compose mount is explicitly read-only.
 
+The local `./data` directory holds a durable SQLite index. The app checks the recording tree at each scan interval, but only parses filenames for new or modified files. The index survives container restarts.
+
 ## Notes
 
 MP4 playback depends on the video/audio codecs produced by the camera. H.264/AAC MP4 is broadly compatible with iOS Safari and Firefox. If a camera writes a different codec, the browser may display the file but not decode it; transcoding would need to be added separately.
