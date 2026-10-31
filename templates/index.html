@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DVR Viewer</title><link rel="icon" href="data:,">
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background:#101113; color:#f4f4f5; }
+    body { margin:0; } header { position:sticky; top:0; z-index:2; padding:12px; background:#191a1e; border-bottom:1px solid #333; display:flex; gap:10px; align-items:center; }
+    select, button { font:inherit; padding:8px; border-radius:6px; border:1px solid #555; background:#25262b; color:inherit; } main { padding:12px; }
+    #status { color:#bbb; margin:8px 0 12px; } .hour { margin:0 0 24px; } .hour h2 { position:sticky; top:58px; z-index:1; margin:0 0 8px; padding:7px 0; background:#101113; font-size:1rem; } .hour-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:10px; }
+    figure { margin:0; border-radius:7px; overflow:hidden; background:#25262b; cursor:pointer; } img { display:block; width:100%; aspect-ratio:16/9; object-fit:cover; } figcaption { padding:5px 7px; font-size:.78rem; color:#ddd; }
+    dialog { width:min(96vw,1000px); max-height:94vh; padding:0; background:#18191d; color:inherit; border:1px solid #555; border-radius:8px; } dialog::backdrop { background:#000b; } #close { float:right; margin:8px; } #detail { clear:both; padding:12px; } video { display:block; max-width:100%; max-height:72vh; margin:auto; } #clips { margin-top:12px; display:grid; gap:12px; } h2 { font-size:1rem; }
+  </style>
+</head>
+<body>
+  <header><strong>DVR Viewer</strong><label>Camera <select id="camera"></select></label><label>Date <select id="day"></select></label><button id="reload">Refresh</button></header>
+  <main><div id="status">Loading recordings…</div><section id="grid"></section></main>
+  <dialog id="viewer"><button id="close">Close</button><div id="detail"><h2 id="clip-title"></h2><div id="clips"></div></div></dialog>
+  <script>
+    const $ = id => document.getElementById(id), api = async url => { const r=await fetch(url); if(!r.ok) throw Error(r.statusText); return r.json() };
+    let gallery = {images:[],videos:[]};
+    const stamp = iso => new Date(iso).toLocaleString([], {dateStyle:'medium', timeStyle:'medium'});
+    function populate(select, options) { select.replaceChildren(...options.map(v => Object.assign(document.createElement('option'), {value:v,textContent:v}))); }
+    function galleryKey(value) { return JSON.stringify([value.images.map(i=>[i.path,i.time]),value.videos.map(v=>[v.path,v.start,v.end])]); }
+    function visibleAnchor() { for (const item of $('grid').querySelectorAll('figure')) { const box=item.getBoundingClientRect(); if (box.bottom > 64) return {path:item.dataset.path, top:box.top}; } return null; }
+    function renderGallery(anchor) { const grid=$('grid'), hours=new Map(); gallery.images.forEach((image,i)=>{const hour=image.time.slice(0,13); if(!hours.has(hour)) hours.set(hour,[]); hours.get(hour).push([image,i]);}); grid.replaceChildren(...[...hours].map(([hour,images])=>{const section=document.createElement('section'), heading=document.createElement('h2'), hourGrid=document.createElement('div'); section.className='hour'; heading.textContent=new Date(hour+':00:00').toLocaleString([], {year:'numeric', month:'short', day:'numeric', hour:'numeric'}); hourGrid.className='hour-grid'; hourGrid.replaceChildren(...images.map(([image,i])=>{let f=document.createElement('figure'); f.dataset.path=image.path; f.innerHTML=`<img loading="lazy" src="/media/${encodeURI(image.path)}" alt="${image.name}"><figcaption>${stamp(image.time)}</figcaption>`; f.onclick=()=>show(i); return f;})); section.append(heading,hourGrid); return section;})); $('status').textContent=`${gallery.images.length} stills · ${gallery.videos.length} videos${gallery.images.length===500?' (showing newest 500)':''}`; if(anchor) { const item=[...grid.querySelectorAll('figure')].find(f=>f.dataset.path===anchor.path); if(item) window.scrollBy(0,item.getBoundingClientRect().top-anchor.top); } }
+    async function loadGallery() { const day=$('day').value, camera=$('camera').value; if(!day||!camera)return; $('status').textContent='Loading…'; gallery=await api(`/api/days/${day}/cameras/${camera}`); renderGallery(); }
+    async function selectCamera() { const dates=await api(`/api/cameras/${encodeURI($('camera').value)}/days`); populate($('day'),dates); await loadGallery(); }
+    function show(i) { const image=gallery.images[i], at=new Date(image.time); $('clip-title').textContent=`Video clips for ${stamp(image.time)}`; const related=gallery.videos.filter(v=>at>=new Date(v.start)&&at<=new Date(v.end)); const clips=$('clips'); clips.replaceChildren(...related.map(v=>{let box=document.createElement('div'); box.innerHTML=`<h2>${stamp(v.start)} – ${new Date(v.end).toLocaleTimeString()}</h2><video controls preload="metadata" playsinline src="/media/${encodeURI(v.path)}"></video>`; return box;})); if(!related.length) clips.textContent='No video clip covers this still image.'; $('viewer').showModal(); }
+    async function init() { try { const cameras=await api('/api/cameras'); populate($('camera'),cameras); if(cameras.length) await selectCamera(); else $('status').textContent='No recordings found. Check the /recordings mount.'; } catch(e) { $('status').textContent='Unable to load recordings: '+e.message; } }
+    async function refreshCurrentGallery() { try { const day=$('day').value, camera=$('camera').value; if(!day||!camera) return; const updated=await api(`/api/days/${day}/cameras/${camera}`); if(galleryKey(updated) !== galleryKey(gallery)) { const anchor=visibleAnchor(); gallery=updated; renderGallery(anchor); } } catch(e) { console.warn('Background gallery refresh failed',e); } }
+    $('camera').onchange=selectCamera; $('day').onchange=loadGallery; $('reload').onclick=init; $('close').onclick=()=>$('viewer').close(); init(); setInterval(refreshCurrentGallery, 30000);
+  </script>
+</body></html>

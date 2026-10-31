@@ -1,0 +1,14 @@
+services:
+  dvrviewer:
+    image: ghcr.io/vntgcode/dvrviewer:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # Defaults to ./recordings; override RECORDINGS_PATH for a NAS mount elsewhere.
+      - ${RECORDINGS_PATH:-./recordings}:/recordings:ro,Z
+    environment:
+      # Seconds between filesystem scans; images added or removed appear after this interval.
+      SCAN_INTERVAL: "15"
+      # Maximum stills shown in a gallery (newest first).
+      IMAGE_LIMIT: "500"
+    restart: unless-stopped
